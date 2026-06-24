@@ -1,97 +1,85 @@
-import requests
-import json
-from json.decoder import JSONDecodeError
-import logging
-from logging.handlers import TimedRotatingFileHandler
 import time
-import os
-import traceback
+import json
+import logging
+from confluent_kafka import Producer
+from apis.seoul_data.realtime_bicycle import RealtimeBicycle
+from datetime import datetime
 
 
-class RealtimeBicycle:
-
-    def __init__(self, dataset_nm):
-        self.auth_key = '##auth_key_seoul_data##'
-        self.api_url = 'http://openapi.seoul.go.kr:8088'
-        self.log_dir = '/log/seoul_api'
-        self.dataset_nm = dataset_nm
-        self.chk_dir()
-        self.log = self._get_logger()
-
-    def call(self):
-        # url 형태: http://openapi.seoul.go.kr:8088/(인증키)/json/bikeList/1/5/
-        base_url = f'{self.api_url}/{self.auth_key}/json/{self.dataset_nm}'
-        start = 1
-        end = 1000
-        total_rows = []
-        while True:
-            try:
-                rslt = self._call_api(base_url, start, end)
-                contents = json.loads(rslt.text)
-            except JSONDecodeError:
-                self.log.error(f'요청 실패, {traceback.format_exc()}')
-                time.sleep(30)  # 30초 대기 후 재시도
-                continue
+BROKER_LST = 'kafka01:9092,kafka02:9092,kafka03:9092'
 
 
-            # 정상이 아닌 경우 처리
-            rslt_code = contents.get('CODE')
-            if rslt_code:
-                # INFO-200: 해당하는 데이터 없음. total_rows 리스트에 값이 존재할 경우
-                # 조회 범위 초과로 에러 발생한 것이며 결과 리턴하고 종료
-                if rslt_code == 'INFO-200' and total_rows:
-                    return total_rows
-                else:
-                    rslt_msg = contents.get('MESSAGE')
-                    self.log.error(f'요청 실패, 에러코드: {rslt_code}, 메시지:{rslt_msg}')
-                    time.sleep(30)      # 30초 대기
+class BicycleProducer():
 
-            key_nm = list(contents.keys())[0]
-            items = contents.get(key_nm)
-            item_cnt = items.get('list_total_count')
-            item_row = items.get('row')
-            self.log.info(f'{base_url}/{start}/{end} 조회 성공, 건수: {len(item_row)}')
-            if item_row:
-                total_rows += item_row
-            if item_cnt < 1000:
-                break
-            else:
-                start = end + 1
-                end += 1000
-        return total_rows
+    def __init__(self, topic):
+        self.topic = topic
+        self.conf = {'bootstrap.servers': BROKER_LST}
+        self.producer = Producer(self.conf)
+        self._set_logger()
 
-    def _call_api(self, base_url, start, end, base_dt=''):
-        headers = {'Content-Type': 'application/json',
-                   'charset': 'utf-8',
-                   'Accept': '*/*'
-                   }
-        if len(base_dt) > 0:
-            url = f'{base_url}/{start}/{end}/{base_dt}'
-        else:
-            url = f'{base_url}/{start}/{end}'
-        rslt = requests.get(url, headers)
-        return rslt
-
-    def chk_dir(self):
-        os.makedirs(self.log_dir, exist_ok=True)
-
-    def _get_logger(self):
-        default_format = '%(asctime)s [%(levelname)s]:%(message)s'
+    def _set_logger(self):
         logging.basicConfig(
-            format=default_format,
+            format='%(asctime)s [%(levelname)s]:%(message)s',
             level=logging.INFO,
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        formatter = logging.Formatter(default_format)
-        handler = TimedRotatingFileHandler(os.path.join(self.log_dir, 'call_bicycle_api.log'), when="midnight", backupCount=7)
-        handler.suffix = "%Y-%m-%d"
-        handler.setFormatter(formatter)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(handler)
+        self.log = logging.getLogger(__name__)
 
-        return logger
+    # Optional per-message delivery callback (triggered by poll() or flush())
+    # when a message has been successfully delivered or permanently
+    # failed delivery (after retries).
+    def delivery_callback(self, err, msg):
+        if err:
+            self.log.error('%% Message failed delivery: %s\n' % err)
+        else:
+            pass
+
+    def produce(self):
+        rt_bycicle = RealtimeBicycle(dataset_nm='bikeList')
+        while True:
+            now_dt = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            items = rt_bycicle.call()
+            for item in items:
+                # 컬럼명 변경
+                item['STT_ID'] = item.pop('stationId')
+                item['STT_NM'] = item.pop('stationName')
+                item['TOT_RACK_CNT'] = item.pop('rackTotCnt')
+                item['TOT_PRK_CNT'] = item.pop('parkingBikeTotCnt')
+                item['RATIO_PRK_RACK'] = item.pop('shared')
+                item['STT_LTTD'] = item.pop('stationLatitude')
+                item['STT_LGTD'] = item.pop('stationLongitude')
 
 
-real_bicycle = RealtimeBicycle(dataset_nm='bikeList')
-items = real_bicycle.call()
-print(items[0:10])
+                # 컬럼 추가
+                item['CRT_DTTM'] = now_dt
+
+                # produce
+                try:
+                    self.producer.produce(
+                        topic=self.topic,
+                        key=json.dumps({'STT_ID': item['STT_ID'],'CRT_DTTM':item['CRT_DTTM']}, ensure_ascii=False),
+                        value=json.dumps(item, ensure_ascii=False),
+                        on_delivery=self.delivery_callback
+                    )
+
+                except BufferError:
+                    self.log.error('%% Local producer queue is full (%d messages awaiting delivery): try again\n' %
+                                     len(self.producer))
+
+            # Serve delivery callback queue.
+            # NOTE: Since produce() is an asynchronous API this poll() call
+            #       will most likely not serve the delivery callback for the
+            #       last produce()d message.
+            self.producer.poll(0)
+
+            # Wait until all messages have been delivered
+            self.log.info('%% Waiting for %d deliveries\n' % len(self.producer))
+            self.producer.flush()
+
+            # 15초 대기
+            time.sleep(15)
+
+
+if __name__ == '__main__':
+    bicycle_producer = BicycleProducer(topic='apis.seouldata.rt-bicycle')
+    bicycle_producer.produce()
